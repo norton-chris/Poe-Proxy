@@ -1,0 +1,12 @@
+# requirements.txt
+fastapi
+fastapi-poe
+uvicorn
+tiktoken==0.6.0
+psutil # You have this, ensure it's needed by proxy.py or remove if not.
+
+# Testing libraries
+pytest
+pytest-asyncio
+pytest-mock
+httpx # For TestClient and potentially direct HTTP calls if needed
