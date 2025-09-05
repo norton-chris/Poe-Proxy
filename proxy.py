@@ -13,7 +13,6 @@ import traceback
 import tiktoken
 import yaml
 import httpx
-from datetime import datetime
 
 # Logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -32,7 +31,11 @@ app.add_middleware(
 
 MODELS_FILE = os.getenv("MODELS_FILE", "models.yaml")
 POE_API_BASE = os.getenv("POE_BASE_URL", "https://api.poe.com")
-POINTS_CUTOFF = int(os.getenv("POINTS_CUTOFF", "100000"))  # stop processing under this balance
+
+# Global usage/balance controls
+POINTS_CUTOFF = int(os.getenv("POINTS_CUTOFF", "100000"))  # pause usage below this balance
+POINTS_PER_MESSAGE_WARN = int(os.getenv("POINTS_PER_MESSAGE_WARN", "5000"))  # warn if a single response costs more than this
+MAX_POINTS_PER_MESSAGE = int(os.getenv("MAX_POINTS_PER_MESSAGE", "0"))  # hard block if > 0 and cost exceeds this; 0 disables hard block
 
 # Error “when it happens” map per Poe docs
 ERROR_WHEN_MAP = {
@@ -49,6 +52,18 @@ ERROR_WHEN_MAP = {
 }
 
 ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
+
+# NEW: cheap model suggestions (adjust as you like)
+CHEAP_ALTERNATIVES = {
+    # expensive -> [cheaper, ...]
+    "GPT-5": ["GPT-4.1-mini", "o4-mini", "Mistral-Small-3.1", "GLM-4.5-FW"],
+    "GPT-4.1": ["GPT-4.1-mini", "o4-mini", "Mistral-Small-3.1"],
+    "Claude-3.5-Sonnet": ["Mistral-Large-2", "Mistral-Small-3.1", "GLM-4.5-FW"],
+    "Gemini-2.5-Pro": ["Gemini-2.5-Flash", "Mistral-Small-3.1"],
+    "DeepSeek-R1": ["DeepSeek-V3.1", "Mistral-Small-3.1"],
+    # default fallback suggestions used if model not mapped:
+    "__default__": ["Mistral-Small-3.1", "GLM-4.5-FW", "GPT-4.1-mini"]
+}
 
 class ModelRegistry:
     """
@@ -143,6 +158,7 @@ def get_poe_api_key() -> str:
     return api_key
 
 def calculate_points_from_registry(model_id: str, total_tokens: int) -> Optional[Dict[str, Any]]:
+    # Legacy estimator; kept as fallback only if Usage API entry is not yet visible.
     try:
         cfg = REGISTRY.get(model_id)
     except KeyError:
@@ -269,9 +285,6 @@ async def poe_get_current_balance(api_key: str) -> Optional[int]:
             return None
 
 async def poe_get_latest_usage_entry(api_key: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch most recent usage entry (limit=1). Returns dict with cost_points and metadata if available.
-    """
     url = f"{POE_API_BASE}/usage/points_history"
     headers = {"Authorization": f"Bearer {api_key}"}
     params = {"limit": 1}
@@ -291,10 +304,6 @@ async def poe_get_latest_usage_entry(api_key: str) -> Optional[Dict[str, Any]]:
 
 async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> Union[AsyncGenerator[Dict[str, Any], None], Dict[str, Any]]:
     """
-    Returns:
-      - If stream=True: async generator of events
-      - If stream=False: response dict
-
     Retry ladder on 400:
       1) as-is
       2) remove max_tokens/max_completion_tokens
@@ -316,25 +325,15 @@ async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> U
         except Exception:
             return "{}"
 
-    # Build attempt variants
     attempts: List[Dict[str, Any]] = []
     base_payload = dict(payload)
     attempts.append(base_payload)
-
-    p2 = dict(base_payload)
-    p2.pop("max_tokens", None)
-    p2.pop("max_completion_tokens", None)
-    attempts.append(p2)
-
-    p3 = dict(base_payload)
+    p2 = dict(base_payload); p2.pop("max_tokens", None); p2.pop("max_completion_tokens", None); attempts.append(p2)
+    p3 = dict(base_payload); 
     if isinstance(p3.get("model"), str):
         p3["model"] = p3["model"].lower()
     attempts.append(p3)
-
-    p4 = dict(p3)
-    p4.pop("max_tokens", None)
-    p4.pop("max_completion_tokens", None)
-    attempts.append(p4)
+    p4 = dict(p3); p4.pop("max_tokens", None); p4.pop("max_completion_tokens", None); attempts.append(p4)
 
     if stream:
         async def stream_attempt(ap: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
@@ -377,7 +376,7 @@ async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> U
                         first_event = evt
                         first_yielded = True
                         if evt.get("type") == "error":
-                            # Try next attempt
+                            # try next attempt
                             break
                         else:
                             yield evt
@@ -410,14 +409,58 @@ async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> U
                 return resp.json()
             raise HTTPException(status_code=400, detail=last_err or "Bad Request")
 
+async def append_footer_with_usage_and_balance(model_id: str, usage_totals: Optional[Dict[str, Any]]) -> str:
+    # Fetch current balance and latest usage entry
+    api_key = get_poe_api_key()
+    balance = await poe_get_current_balance(api_key)
+    latest = await poe_get_latest_usage_entry(api_key)
+
+    lines = []
+    if usage_totals:
+        total = usage_totals.get('total_tokens')
+        prompt = usage_totals.get('prompt_tokens')
+        completion = usage_totals.get('completion_tokens')
+        lines.append(f"📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})")
+
+    points_used = None
+    if latest and isinstance(latest.get("cost_points"), (int, float)):
+        points_used = int(latest["cost_points"])
+        lines.append(f"💰 Points: {points_used}")
+    else:
+        # Fallback: estimate from models.yaml if available and we have token totals
+        if usage_totals:
+            total = usage_totals.get('total_tokens') or 0
+            est = calculate_points_from_registry(model_id, total)
+            if est:
+                lines.append(f"💰 Points (est.): {est['points']} ({est['breakdown']})")
+
+    if balance is not None:
+        lines.append(f"🏦 Current balance: {balance} points")
+
+    # NEW: warn if this single message used too many points
+    warning = ""
+    if points_used is not None and POINTS_PER_MESSAGE_WARN > 0 and points_used > POINTS_PER_MESSAGE_WARN:
+        suggestions = CHEAP_ALTERNATIVES.get(model_id) or CHEAP_ALTERNATIVES.get("__default__", [])
+        suggest_text = ", ".join(suggestions[:3]) if suggestions else "a cheaper model"
+        warning = (
+            "\n⚠️ High cost detected for this response.\n"
+            "- Your current chat might have long context. Consider starting a new chat to reduce context length.\n"
+            f"- Or try a cheaper model: {suggest_text}\n"
+        )
+        # Optional hard block (for future requests) when a single message exceeds MAX_POINTS_PER_MESSAGE
+        if MAX_POINTS_PER_MESSAGE > 0 and points_used > MAX_POINTS_PER_MESSAGE:
+            warning += "- Further requests may be blocked due to exceeding per-message point limit.\n"
+
+    footer = ""
+    if lines or warning:
+        footer = "\n\n---\n" + "\n".join(lines) + (("\n" + warning) if warning else "")
+
+    return footer
+
 async def stream_openai_sse_response_from_poe(
     payload: Dict[str, Any],
     request_id: str
 ) -> AsyncGenerator[str, None]:
-    """
-    Streams response and appends footer with tokens, points (if configured),
-    and current balance from Usage API.
-    """
     model_id = payload.get("model", "unknown")
     gen = await call_poe_openai_compatible(payload, stream=True)
     usage_totals: Optional[Dict[str, Any]] = None
@@ -442,63 +485,18 @@ async def stream_openai_sse_response_from_poe(
                 yield format_sse_chunk(data_dict={"content": delta["content"]}, request_id=request_id, model_name=model_id)
 
             if finish_reason:
-                # Fetch current balance
-                balance = await poe_get_current_balance(get_poe_api_key())
-
-                footer_lines = []
-                if usage_totals:
-                    total = usage_totals.get('total_tokens')
-                    prompt = usage_totals.get('prompt_tokens')
-                    completion = usage_totals.get('completion_tokens')
-                    footer_lines.append(f"📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})")
-
-                    # Try to get actual points from Usage API last entry
-                    last_usage = await poe_get_latest_usage_entry(get_poe_api_key())
-                    if last_usage and isinstance(last_usage.get("cost_points"), (int, float)):
-                        footer_lines.append(f"💰 Points: {last_usage['cost_points']}")
-                    else:
-                        # fallback to configured pricing if present
-                        pts = calculate_points_from_registry(model_id, (total or 0))
-                        if pts:
-                            footer_lines.append(f"💰 Points: {pts['points']} ({pts['breakdown']})")
-
-                if balance is not None:
-                    footer_lines.append(f"🏦 Current balance: {balance} points")
-
-                footer = "\n\n---\n" + "\n".join(footer_lines) if footer_lines else ""
+                footer = await append_footer_with_usage_and_balance(model_id, usage_totals)
                 yield format_sse_chunk(data_dict={"content": footer}, request_id=request_id, model_name=model_id, finish_reason="stop")
                 yield "data: [DONE]\n\n"
                 return
 
         if evt["type"] == "done":
-            # If stream ends without finish_reason, still attach balance/tokens if we captured any
-            balance = await poe_get_current_balance(get_poe_api_key())
-            footer_lines = []
-            if usage_totals:
-                total = usage_totals.get('total_tokens')
-                prompt = usage_totals.get('prompt_tokens')
-                completion = usage_totals.get('completion_tokens')
-                footer_lines.append(f"📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})")
-                last_usage = await poe_get_latest_usage_entry(get_poe_api_key())
-                if last_usage and isinstance(last_usage.get("cost_points"), (int, float)):
-                    footer_lines.append(f"💰 Points: {last_usage['cost_points']}")
-                else:
-                    pts = calculate_points_from_registry(model_id, (total or 0))
-                    if pts:
-                        footer_lines.append(f"💰 Points: {pts['points']} ({pts['breakdown']})")
-            if balance is not None:
-                footer_lines.append(f"🏦 Current balance: {balance} points")
-
-            footer = "\n\n---\n" + "\n".join(footer_lines) if footer_lines else ""
+            footer = await append_footer_with_usage_and_balance(model_id, usage_totals)
             yield format_sse_chunk(data_dict={"content": footer}, request_id=request_id, model_name=model_id, finish_reason="stop")
             yield "data: [DONE]\n\n"
             return
 
 async def nonstream_openai_response_from_poe(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Non-streaming call. Appends footer with tokens, points (if configured),
-    and current balance from Usage API.
-    """
     model_id = payload.get("model", "unknown")
     try:
         data = await call_poe_openai_compatible(payload, stream=False)
@@ -506,29 +504,9 @@ async def nonstream_openai_response_from_poe(payload: Dict[str, Any]) -> Dict[st
             data["choices"] = [{"message": {"role": "assistant", "content": ""}}]
 
         usage = data.get("usage")
-        footer_lines = []
+        footer = await append_footer_with_usage_and_balance(model_id, usage)
 
-        if isinstance(usage, dict):
-            total = usage.get('total_tokens')
-            prompt = usage.get('prompt_tokens')
-            completion = usage.get('completion_tokens')
-            footer_lines.append(f"📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})")
-
-            # Try real points from Usage API last entry
-            last_usage = await poe_get_latest_usage_entry(get_poe_api_key())
-            if last_usage and isinstance(last_usage.get("cost_points"), (int, float)):
-                footer_lines.append(f"💰 Points: {last_usage['cost_points']}")
-            else:
-                pts = calculate_points_from_registry(model_id, (total or 0))
-                if pts:
-                    footer_lines.append(f"💰 Points: {pts['points']} ({pts['breakdown']})")
-
-        balance = await poe_get_current_balance(get_poe_api_key())
-        if balance is not None:
-            footer_lines.append(f"🏦 Current balance: {balance} points")
-
-        if footer_lines:
-            footer = "\n\n---\n" + "\n".join(footer_lines)
+        if footer:
             content = data["choices"][0]["message"].get("content") or ""
             data["choices"][0]["message"]["content"] = f"{content}{footer}"
         return data
@@ -539,7 +517,7 @@ async def nonstream_openai_response_from_poe(payload: Dict[str, Any]) -> Dict[st
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    DEBUG_TAGS = {"request_start": "🌍��️", "request_end": "🔚", "api_call": "📡", "error": "🔴", "rate_limit": "⏳"}
+    DEBUG_TAGS = {"request_start": "🌍🗳️", "request_end": "🔚", "api_call": "📡", "error": "🔴", "rate_limit": "⏳"}
     request.state.start_time = time.time()
 
     try:
@@ -584,7 +562,6 @@ async def chat_completions(request: Request):
         try:
             model_cfg = REGISTRY.get(model_id)
         except KeyError:
-            # We will also try lowercase on transport layer; here return 404 for clarity
             raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
         modality = model_cfg.get("modality", "text")
