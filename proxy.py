@@ -13,6 +13,7 @@ import traceback
 import tiktoken
 import yaml
 import httpx
+from datetime import datetime
 
 # Logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -30,6 +31,8 @@ app.add_middleware(
 )
 
 MODELS_FILE = os.getenv("MODELS_FILE", "models.yaml")
+POE_API_BASE = os.getenv("POE_BASE_URL", "https://api.poe.com")
+POINTS_CUTOFF = int(os.getenv("POINTS_CUTOFF", "100000"))  # stop processing under this balance
 
 # Error “when it happens” map per Poe docs
 ERROR_WHEN_MAP = {
@@ -132,6 +135,13 @@ except Exception as e:
     logger.error(f"Failed to load model registry: {e}")
     raise
 
+@lru_cache()
+def get_poe_api_key() -> str:
+    api_key = os.getenv("POE_API_KEY") or os.getenv("POE_TOKEN")
+    if not api_key:
+        raise ValueError("POE_API_KEY or POE_TOKEN environment variable not set")
+    return api_key
+
 def calculate_points_from_registry(model_id: str, total_tokens: int) -> Optional[Dict[str, Any]]:
     try:
         cfg = REGISTRY.get(model_id)
@@ -146,13 +156,6 @@ def calculate_points_from_registry(model_id: str, total_tokens: int) -> Optional
     base_display = int(base) if float(base).is_integer() else base
     breakdown = f"Base: {base_display}, Tokens: {token_points:.1f}"
     return {"points": round(points, 1), "breakdown": breakdown}
-
-@lru_cache()
-def get_poe_token():
-    api_key = os.getenv("POE_API_KEY") or os.getenv("POE_TOKEN")
-    if not api_key:
-        raise ValueError("POE_API_KEY or POE_TOKEN environment variable not set")
-    return api_key
 
 def count_tokens(text: str, model_hint: str) -> int:
     try:
@@ -248,6 +251,44 @@ def clip_context_by_tokens(messages: List[Dict[str, str]], model_id: str, per_bo
 
     return system_msgs + kept
 
+# Usage API helpers
+async def poe_get_current_balance(api_key: str) -> Optional[int]:
+    url = f"{POE_API_BASE}/usage/current_balance"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger.warning(f"Balance fetch failed: {resp.status_code} {resp.text}")
+                return None
+            data = resp.json()
+            return int(data.get("current_point_balance")) if "current_point_balance" in data else None
+        except Exception as e:
+            logger.warning(f"Balance fetch error: {e}")
+            return None
+
+async def poe_get_latest_usage_entry(api_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch most recent usage entry (limit=1). Returns dict with cost_points and metadata if available.
+    """
+    url = f"{POE_API_BASE}/usage/points_history"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    params = {"limit": 1}
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                logger.warning(f"Usage history fetch failed: {resp.status_code} {resp.text}")
+                return None
+            data = resp.json()
+            items = data.get("data") or []
+            return items[0] if items else None
+        except Exception as e:
+            logger.warning(f"Usage history error: {e}")
+            return None
+
 async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> Union[AsyncGenerator[Dict[str, Any], None], Dict[str, Any]]:
     """
     Returns:
@@ -260,13 +301,13 @@ async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> U
       3) lowercase model
       4) lowercase + remove max_tokens
     """
-    api_key = get_poe_token()
+    api_key = get_poe_api_key()
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    base_url = os.getenv("POE_BASE_URL", "https://api.poe.com/v1")
-    url = f"{base_url}/chat/completions"
+    base_url = POE_API_BASE.rstrip("/")
+    url = f"{base_url}/v1/chat/completions"
 
     def redact_payload_for_log(p: Dict[str, Any]) -> str:
         try:
@@ -297,7 +338,6 @@ async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> U
 
     if stream:
         async def stream_attempt(ap: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
-            # Create a client per attempt and keep it open for the duration of this generator
             timeout = httpx.Timeout(300.0, connect=30.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream("POST", url, headers=headers, json=ap) as resp:
@@ -328,7 +368,6 @@ async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> U
                         except Exception:
                             continue
 
-        # Orchestrate attempts sequentially; on first event "error", try next; else forward
         async def orchestrator():
             for ap in attempts:
                 first_event: Optional[Dict[str, Any]] = None
@@ -344,17 +383,13 @@ async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> U
                             yield evt
                     else:
                         yield evt
-                # If first_event was error, continue to next attempt
                 if first_event and first_event.get("type") != "error":
-                    # Successful attempt already streaming; we consumed until done
                     return
-            # All attempts failed; emit last error
             yield {"type": "error", "text": "[All streaming attempts failed]"}
 
         return orchestrator()
 
     else:
-        # Non-streaming attempts
         timeout = httpx.Timeout(300.0, connect=30.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             last_err = None
@@ -379,6 +414,10 @@ async def stream_openai_sse_response_from_poe(
     payload: Dict[str, Any],
     request_id: str
 ) -> AsyncGenerator[str, None]:
+    """
+    Streams response and appends footer with tokens, points (if configured),
+    and current balance from Usage API.
+    """
     model_id = payload.get("model", "unknown")
     gen = await call_poe_openai_compatible(payload, stream=True)
     usage_totals: Optional[Dict[str, Any]] = None
@@ -403,48 +442,93 @@ async def stream_openai_sse_response_from_poe(
                 yield format_sse_chunk(data_dict={"content": delta["content"]}, request_id=request_id, model_name=model_id)
 
             if finish_reason:
-                footer = ""
+                # Fetch current balance
+                balance = await poe_get_current_balance(get_poe_api_key())
+
+                footer_lines = []
                 if usage_totals:
                     total = usage_totals.get('total_tokens')
                     prompt = usage_totals.get('prompt_tokens')
                     completion = usage_totals.get('completion_tokens')
-                    footer = f"\n\n---\n📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})"
-                    pts = calculate_points_from_registry(model_id, (total or 0))
-                    if pts:
-                        footer += f"\n💰 Points: {pts['points']} ({pts['breakdown']})"
+                    footer_lines.append(f"📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})")
+
+                    # Try to get actual points from Usage API last entry
+                    last_usage = await poe_get_latest_usage_entry(get_poe_api_key())
+                    if last_usage and isinstance(last_usage.get("cost_points"), (int, float)):
+                        footer_lines.append(f"💰 Points: {last_usage['cost_points']}")
+                    else:
+                        # fallback to configured pricing if present
+                        pts = calculate_points_from_registry(model_id, (total or 0))
+                        if pts:
+                            footer_lines.append(f"💰 Points: {pts['points']} ({pts['breakdown']})")
+
+                if balance is not None:
+                    footer_lines.append(f"🏦 Current balance: {balance} points")
+
+                footer = "\n\n---\n" + "\n".join(footer_lines) if footer_lines else ""
                 yield format_sse_chunk(data_dict={"content": footer}, request_id=request_id, model_name=model_id, finish_reason="stop")
                 yield "data: [DONE]\n\n"
                 return
 
         if evt["type"] == "done":
-            footer = ""
+            # If stream ends without finish_reason, still attach balance/tokens if we captured any
+            balance = await poe_get_current_balance(get_poe_api_key())
+            footer_lines = []
             if usage_totals:
                 total = usage_totals.get('total_tokens')
                 prompt = usage_totals.get('prompt_tokens')
                 completion = usage_totals.get('completion_tokens')
-                footer = f"\n\n---\n📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})"
-                pts = calculate_points_from_registry(model_id, (total or 0))
-                if pts:
-                    footer += f"\n💰 Points: {pts['points']} ({pts['breakdown']})"
+                footer_lines.append(f"📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})")
+                last_usage = await poe_get_latest_usage_entry(get_poe_api_key())
+                if last_usage and isinstance(last_usage.get("cost_points"), (int, float)):
+                    footer_lines.append(f"💰 Points: {last_usage['cost_points']}")
+                else:
+                    pts = calculate_points_from_registry(model_id, (total or 0))
+                    if pts:
+                        footer_lines.append(f"💰 Points: {pts['points']} ({pts['breakdown']})")
+            if balance is not None:
+                footer_lines.append(f"🏦 Current balance: {balance} points")
+
+            footer = "\n\n---\n" + "\n".join(footer_lines) if footer_lines else ""
             yield format_sse_chunk(data_dict={"content": footer}, request_id=request_id, model_name=model_id, finish_reason="stop")
             yield "data: [DONE]\n\n"
             return
 
 async def nonstream_openai_response_from_poe(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Non-streaming call. Appends footer with tokens, points (if configured),
+    and current balance from Usage API.
+    """
     model_id = payload.get("model", "unknown")
     try:
         data = await call_poe_openai_compatible(payload, stream=False)
         if "choices" not in data or not data["choices"]:
             data["choices"] = [{"message": {"role": "assistant", "content": ""}}]
+
         usage = data.get("usage")
+        footer_lines = []
+
         if isinstance(usage, dict):
             total = usage.get('total_tokens')
             prompt = usage.get('prompt_tokens')
             completion = usage.get('completion_tokens')
-            footer = f"\n\n---\n📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})"
-            pts = calculate_points_from_registry(model_id, (total or 0))
-            if pts:
-                footer += f"\n💰 Points: {pts['points']} ({pts['breakdown']})"
+            footer_lines.append(f"📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})")
+
+            # Try real points from Usage API last entry
+            last_usage = await poe_get_latest_usage_entry(get_poe_api_key())
+            if last_usage and isinstance(last_usage.get("cost_points"), (int, float)):
+                footer_lines.append(f"💰 Points: {last_usage['cost_points']}")
+            else:
+                pts = calculate_points_from_registry(model_id, (total or 0))
+                if pts:
+                    footer_lines.append(f"💰 Points: {pts['points']} ({pts['breakdown']})")
+
+        balance = await poe_get_current_balance(get_poe_api_key())
+        if balance is not None:
+            footer_lines.append(f"🏦 Current balance: {balance} points")
+
+        if footer_lines:
+            footer = "\n\n---\n" + "\n".join(footer_lines)
             content = data["choices"][0]["message"].get("content") or ""
             data["choices"][0]["message"]["content"] = f"{content}{footer}"
         return data
@@ -454,8 +538,8 @@ async def nonstream_openai_response_from_poe(payload: Dict[str, Any]) -> Dict[st
         raise HTTPException(status_code=status, detail={"error": {"code": status, "type": ERROR_WHEN_MAP.get(status, ('unknown_error',''))[0], "message": msg, "metadata": {}}})
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, poe_token: str = Depends(get_poe_token)):
-    DEBUG_TAGS = {"request_start": "🌍🗳️", "request_end": "🔚", "api_call": "📡", "error": "🔴", "cache": "💾", "rate_limit": "⏳"}
+async def chat_completions(request: Request):
+    DEBUG_TAGS = {"request_start": "🌍��️", "request_end": "🔚", "api_call": "📡", "error": "🔴", "rate_limit": "⏳"}
     request.state.start_time = time.time()
 
     try:
@@ -475,6 +559,22 @@ async def chat_completions(request: Request, poe_token: str = Depends(get_poe_to
         bucket["count"] += 1
         request.app.state.rate_limits[client_ip] = bucket
 
+        # Balance gate: if balance < cutoff, refuse and inform user
+        api_key = get_poe_api_key()
+        balance = await poe_get_current_balance(api_key)
+        if balance is not None and balance < POINTS_CUTOFF:
+            message = (
+                f"⚠️ API usage paused: Only {balance} points remaining. "
+                f"Points replenish on the 11th of the month. Please try again after replenishment."
+            )
+            return {
+                "id": f"chatcmpl-{uuid4()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "usage-guard",
+                "choices": [{"message": {"role": "assistant", "content": message}}]
+            }
+
         body = await request.body()
         data = json.loads(body.decode())
 
@@ -484,6 +584,7 @@ async def chat_completions(request: Request, poe_token: str = Depends(get_poe_to
         try:
             model_cfg = REGISTRY.get(model_id)
         except KeyError:
+            # We will also try lowercase on transport layer; here return 404 for clarity
             raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
         modality = model_cfg.get("modality", "text")
@@ -497,12 +598,12 @@ async def chat_completions(request: Request, poe_token: str = Depends(get_poe_to
             logger.debug("Overriding n to 1 for Poe compatibility")
             data["n"] = 1
 
-        # Clip context by tokens for text bots using per-bot cap and global cap
+        # Clip context by tokens for text bots
         per_bot_cap = model_cfg.get("max_tokens") if modality == "text" else None
         global_cap = REGISTRY.get_default_text_max_tokens() if modality == "text" else None
         clipped_messages = clip_context_by_tokens(sanitized_messages, model_id, per_bot_cap, global_cap) if modality == "text" else sanitized_messages
 
-        # Build payload
+        # Build payload (do NOT auto-inject max_tokens)
         payload = {
             "model": model_id,
             "messages": clipped_messages,
