@@ -4,6 +4,7 @@ fastapi-poe
 uvicorn
 tiktoken==0.6.0
 psutil # You have this, ensure it's needed by proxy.py or remove if not.
+pyyaml
 
 # Testing libraries
 pytest

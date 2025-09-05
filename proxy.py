@@ -1,36 +1,26 @@
 import os
 import json
-import fastapi_poe as fp
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import StreamingResponse # Import StreamingResponse
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from functools import lru_cache
 import uvicorn
 import logging
 import time
-from typing import Optional, Dict, Any, Union, AsyncGenerator, List # Add List
+from typing import Optional, Dict, Any, Union, AsyncGenerator, List, Tuple
 from uuid import uuid4
 import traceback
 import tiktoken
-from contextlib import asynccontextmanager
+import yaml
 import httpx
-from datetime import datetime
-import asyncio
 
-# Enhanced logging setup
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Enable detailed logging for external libraries
-# logging.getLogger("fastapi_poe").setLevel(logging.DEBUG) # Can be noisy
-# logging.getLogger("httpx").setLevel(logging.DEBUG) # Can be noisy
 
 app = FastAPI()
 
-# Add CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,343 +29,141 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-POE_TOKEN = os.getenv("POE_TOKEN")
+MODELS_FILE = os.getenv("MODELS_FILE", "models.yaml")
 
-# Define cost structures
-POINT_COSTS = {
-    "gemini-1.5-pro": {"base": 175, "per_1k_tokens": 0},
-    "gemini-2.0-flash": {"base": 20, "per_1k_tokens": 2},
-    "gemini-2.0-pro": {"base": 1500, "per_1k_tokens": 2},
-    "gemini-2.5-pro-exp": {"base": 261, "per_1k_tokens": 13},
-    "claude-3.5-sonnet": {"base": 297, "per_1k_tokens": 115},
-    "claude-3.7-sonnet": {"base": 807, "per_1k_tokens": 115},
-    "gpt-4.1": {"base": 213, "per_1k_tokens": 67},
-    "gpt-4o-mini": {"base": 15, "per_1k_tokens": 0},
-    "o3-mini": {"base": 255, "per_1k_tokens": 37},
-    "o3-mini-high": {"base": 628, "per_1k_tokens": 37},
-    "web-search": {"base": 15, "per_1k_tokens": 0},
-    "DeepSeek-R1": {"base": 600, "per_1k_tokens": 0},
-    "DeepSeek-V3-FW": {"base": 300, "per_1k_tokens": 0},
-    "llama-3-70b-groq": {"base": 75, "per_1k_tokens": 0},
-    "llama-3.1-405b": {"base": 43, "per_1k_tokens": 100},
-    "llama-4-maverick": {"base": 50, "per_1k_tokens": 0},
-    "llama-4-scout": {"base": 30, "per_1k_tokens": 0},
-    "mistral-small-3": {"base": 9, "per_1k_tokens": 4},
-    "mistral-large-2": {"base": 204, "per_1k_tokens": 100},
-    "perplexity-sonar": {"base": 317, "per_1k_tokens": 0},
-    "QwQ-32B-T": {"base": 250, "per_1k_tokens": 0}
+# Error “when it happens” map per Poe docs
+ERROR_WHEN_MAP = {
+    400: ("invalid_request_error", "Malformed JSON or missing fields"),
+    401: ("authentication_error", "Bad or expired API key"),
+    402: ("insufficient_credits", "Balance ≤ 0"),
+    403: ("moderation_error", "Permission denied or authorization issues"),
+    404: ("not_found_error", "Wrong endpoint or model"),
+    408: ("timeout_error", "Model didn't start in a reasonable time"),
+    413: ("request_too_large", "Tokens > context window"),
+    429: ("rate_limit_error", "RPM/TPM cap hit"),
+    502: ("upstream_error", "Model backend not working"),
+    529: ("overloaded_error", "Transient traffic spike"),
 }
 
-# Map of model names to Poe bot names
-MODEL_MAP = {
-    "claude-3.5-sonnet": "Claude-3.5-Sonnet", # Poe often uses capitalized names
-    "claude-3.7-sonnet": "Claude-3-Opus", # Example, ensure correct Poe bot name
-    "gpt-4.1": "GPT-4", # Example, ensure correct Poe bot name
-    "gpt-4o-mini": "GPT-4o-mini",
-    "o3-mini": "o3-mini",
-    "o3-mini-high": "o3-mini-high",
-    "gemini-1.5-pro": "Gemini-1.5-Pro",
-    "gemini-2.0-flash": "Gemini-Flash",
-    "gemini-2.0-pro": "Gemini-Pro",
-    "gemini-2.5-pro-exp": "gemini-2.5-pro-exp",
-    "web-search": "Web-Search",
-    "DeepSeek-R1": "DeepSeek-R1",
-    "DeepSeek-V3-FW": "DeepSeek-V3-FW",
-    "llama-3-70b-groq": "Llama-3-70b-Groq",
-    "llama-3.1-405b": "Meta-Llama-3.1-405B",
-    "llama-4-maverick": "llama-4-maverick",
-    "llama-4-scout": "llama-4-scout",
-    "mistral-small-3": "Mistral-Small",
-    "mistral-large-2": "Mistral-Large",
-    "perplexity-sonar": "Perplexity-Sonar",
-    "QwQ-32B-T": "QwQ-32B-T"
-}
+ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
-# Define context limits for different models (ideally in TOKENS, these are still chars)
-# IMPORTANT: These should be actual TOKEN limits for the Poe bots, not character counts.
-# The current values are placeholders and likely incorrect for token-based limits.
-MODEL_CONTEXT_LIMITS = {
-    "Claude-3.5-Sonnet": 200000, # This is likely chars, find token limit
-    "Claude-3-Opus": 200000,    # This is likely chars, find token limit
-    "GPT-4": 128000,             # This is likely chars, find token limit for Poe's version
-    "GPT-4o-mini": 128000,
-    "o3-mini": 128000,
-    "o3-mini-high": 128000,
-    "Gemini-1.5-Pro": 1000000,   # Example token limit
-    "Gemini-Flash": 1000000,
-    "Gemini-Pro": 1000000,
-    "gemini-2.5-pro-exp": 1000000,
-    "Web-Search": 8000,          # Likely chars
-    "DeepSeek-R1": 128000,       # Example token limit
-    "DeepSeek-V3-FW": 128000,    # Example token limit (Poe's might be 32k or 128k)
-    "Llama-3-70b-Groq": 8000,
-    "Meta-Llama-3.1-405B": 128000,
-    "llama-4-maverick": 1000000,
-    "llama-4-scout": 10000000,
-    "Mistral-Small": 32000,
-    "Mistral-Large": 32000,
-    "Perplexity-Sonar": 16000,
-    "QwQ-32B-T": 32000
-}
+class ModelRegistry:
+    """
+    models.yaml example:
+
+    defaults:
+      text_max_tokens: 200000
+    models:
+      text:
+        - poe_name: Claude-3.5-Sonnet
+          base: 297
+          per_1k_tokens: 115
+          max_tokens: 200000
+        - GPT-4.1
+      image:
+        - GPT-Image-1
+      video:
+        - Veo-3
+      audio:
+        - ElevenLabs
+    """
+    def __init__(self, path: str):
+        self.path = path
+        self.defaults: Dict[str, Any] = {
+            "text_max_tokens": 200000
+        }
+        self.models: Dict[str, Dict[str, Any]] = {}
+        self.load()
+
+    def load(self):
+        if not os.path.exists(self.path):
+            raise FileNotFoundError(f"Model config file not found: {self.path}")
+        with open(self.path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        defaults = data.get("defaults") or {}
+        if "text_max_tokens" in defaults:
+            self.defaults["text_max_tokens"] = int(defaults["text_max_tokens"])
+
+        self.models.clear()
+        grouped = (data.get("models") or {})
+        for modality in ("text", "image", "video", "audio"):
+            for item in grouped.get(modality, []) or []:
+                if isinstance(item, str):
+                    poe_name = item
+                    model_cfg = {"poe_name": poe_name, "modality": modality}
+                elif isinstance(item, dict):
+                    poe_name = item.get("poe_name")
+                    if not poe_name:
+                        raise ValueError(f"Missing poe_name in models.{modality} entry: {item}")
+                    model_cfg = {
+                        "poe_name": poe_name,
+                        "modality": modality,
+                    }
+                    if "base" in item:
+                        model_cfg["base"] = float(item["base"])
+                    if "per_1k_tokens" in item:
+                        model_cfg["per_1k_tokens"] = float(item["per_1k_tokens"])
+                    if "max_tokens" in item:
+                        try:
+                            model_cfg["max_tokens"] = int(item["max_tokens"])
+                        except Exception:
+                            logger.warning(f"Ignoring non-int max_tokens for {poe_name}")
+                else:
+                    raise ValueError(f"Invalid entry in models.{modality}: {item}")
+                self.models[poe_name] = model_cfg
+
+        logger.info(f"Loaded {len(self.models)} models from {self.path}")
+
+    def get(self, model_id: str) -> Dict[str, Any]:
+        if model_id not in self.models:
+            raise KeyError(f"Model '{model_id}' not found")
+        return self.models[model_id]
+
+    def list_ids(self) -> List[str]:
+        return list(self.models.keys())
+
+    def get_default_text_max_tokens(self) -> int:
+        return int(self.defaults["text_max_tokens"])
+
+try:
+    REGISTRY = ModelRegistry(MODELS_FILE)
+except Exception as e:
+    logger.error(f"Failed to load model registry: {e}")
+    raise
+
+def calculate_points_from_registry(model_id: str, total_tokens: int) -> Optional[Dict[str, Any]]:
+    try:
+        cfg = REGISTRY.get(model_id)
+    except KeyError:
+        return None
+    base = cfg.get("base")
+    per_k = cfg.get("per_1k_tokens")
+    if base is None or per_k is None:
+        return None
+    token_points = (total_tokens / 1000.0) * per_k
+    points = float(base) + token_points
+    base_display = int(base) if float(base).is_integer() else base
+    breakdown = f"Base: {base_display}, Tokens: {token_points:.1f}"
+    return {"points": round(points, 1), "breakdown": breakdown}
 
 @lru_cache()
 def get_poe_token():
-    token = os.getenv("POE_TOKEN")
-    if not token:
-        raise ValueError("POE_TOKEN environment variable not set")
-    return token
+    api_key = os.getenv("POE_API_KEY") or os.getenv("POE_TOKEN")
+    if not api_key:
+        raise ValueError("POE_API_KEY or POE_TOKEN environment variable not set")
+    return api_key
 
-def count_tokens(text: str, model: str) -> int:
-    """Estimate token count based on model"""
+def count_tokens(text: str, model_hint: str) -> int:
     try:
-        # Use tiktoken for OpenAI models or models known to use similar tokenization
-        if "gpt" in model.lower() or "claude" in model.lower() or "gemini" in model.lower(): # Add other knowns
-            encoder = tiktoken.encoding_for_model("gpt-4") # A common default
-            return len(encoder.encode(text))
-        # Fallback for other models (very rough estimate)
+        if any(x in model_hint.lower() for x in ["gpt", "claude", "gemini"]):
+            enc = tiktoken.encoding_for_model("gpt-4")
+            return len(enc.encode(text))
         return len(text) // 4
     except Exception as e:
-        logger.warning(f"Error counting tokens for model {model} with tiktoken, falling back: {e}")
-        return len(text) // 4 # Fallback
+        logger.warning(f"Token count fallback for {model_hint}: {e}")
+        return len(text) // 4
 
-def calculate_points(model_key: str, total_tokens: int, has_images: bool = False) -> Dict[str, Union[int, str]]:
-    # Use the original OpenAI model key to look up costs, as POINT_COSTS uses these keys
-    if model_key not in POINT_COSTS:
-        return {"points": "Unknown", "breakdown": f"Model key '{model_key}' not found in cost structure"}
-    
-    cost = POINT_COSTS[model_key]
-    base_points = cost["base"]
-    token_points = (total_tokens / 1000) * cost["per_1k_tokens"]
-    
-    image_points = 0
-    # Ensure 'claude' check is against the original OpenAI model key if that's how costs are defined
-    if has_images and "claude" in model_key.lower(): # Or use Poe bot name if costs are tied to that
-        image_points = (total_tokens / 1000) * 100 # Example image point cost
-    
-    total_points_val = base_points + token_points + image_points
-    
-    breakdown = f"Base: {base_points}"
-    if token_points > 0:
-        breakdown += f", Tokens: {token_points:.1f}"
-    if image_points > 0:
-        breakdown += f", Images: {image_points:.1f}"
-    
-    return {
-        "points": round(total_points_val, 1),
-        "breakdown": breakdown
-    }
-
-def clean_content(content) -> Union[str, list]:
-    if isinstance(content, list):
-        return content
-    if isinstance(content, str):
-        if "\n\n---\n📊" in content: # Your custom footer marker
-            return content.split("\n\n---\n📊")[0].strip()
-        return content.strip()
-    return str(content).strip()
-
-def enforce_context_limit(messages: List[Dict[str, Any]], poe_bot_name: str, limit_override: Optional[int] = None) -> List[Dict[str, Any]]:
-    # Ensure count_tokens uses poe_bot_name if its logic depends on the specific bot
-    # For now, count_tokens takes a generic model string, which might map to tiktoken or fallback.
-    
-    def calculate_message_tokens(message_content) -> int:
-        if isinstance(message_content, list):
-            total = 0
-            for part in message_content:
-                if part.get("type") == "text":
-                    total += count_tokens(part.get("text", ""), poe_bot_name) # Pass poe_bot_name
-                elif part.get("type") == "image":
-                    total += 512 
-            return total
-        return count_tokens(str(message_content), poe_bot_name) # Pass poe_bot_name
-
-    # Use poe_bot_name to get the limit
-    model_token_limit = limit_override if limit_override is not None else MODEL_CONTEXT_LIMITS.get(poe_bot_name, 32000) # Default if not found
-    logger.debug(f"Enforcing token limit of {model_token_limit} for Poe bot: {poe_bot_name}")
-
-    cleaned_messages: List[Dict[str, Any]] = []
-    total_tokens = 0
-    for msg in messages:
-        cleaned_msg = msg.copy()
-        if "content" in cleaned_msg:
-            # clean_content might not be necessary here if we're just counting tokens for truncation
-            # cleaned_msg["content"] = clean_content(cleaned_msg["content"]) # clean_content might alter it before token counting
-            msg_tokens = calculate_message_tokens(cleaned_msg["content"])
-            total_tokens += msg_tokens
-            logger.debug(f"{cleaned_msg.get('role')} message tokens: {msg_tokens} (for {poe_bot_name})")
-        cleaned_messages.append(cleaned_msg)
-    
-    logger.debug(f"Total tokens across all messages for {poe_bot_name}: {total_tokens}")
-
-    if total_tokens <= model_token_limit:
-        logger.debug(f"Content for {poe_bot_name} within token limits, no trimming needed.")
-        return cleaned_messages
-
-    logger.warning(f"Content for {poe_bot_name} exceeds token limit ({total_tokens} > {model_token_limit}), trimming...")
-    system_msg = None
-    user_msgs = []
-    for msg in cleaned_messages:
-        if msg.get("role") == "system":
-            system_msg = msg
-        else:
-            user_msgs.append(msg)
-
-    available_tokens = model_token_limit
-    if system_msg:
-        system_tokens = calculate_message_tokens(system_msg.get("content", ""))
-        if system_tokens > available_tokens: # System prompt alone is too large
-            logger.warning(f"System prompt for {poe_bot_name} ({system_tokens} tokens) exceeds limit ({available_tokens}). Returning empty.")
-            return [] 
-        available_tokens -= system_tokens
-    
-    trimmed_user_msgs: List[Dict[str, Any]] = []
-    current_tokens = 0
-    for msg in reversed(user_msgs):
-        msg_tokens = calculate_message_tokens(msg.get("content", ""))
-        if current_tokens + msg_tokens <= available_tokens:
-            trimmed_user_msgs.insert(0, msg)
-            current_tokens += msg_tokens
-        else:
-            break
-            
-    final_trimmed_messages: List[Dict[str, Any]] = []
-    if system_msg:
-        final_trimmed_messages.append(system_msg)
-    final_trimmed_messages.extend(trimmed_user_msgs)
-    
-    final_tokens = sum(calculate_message_tokens(msg.get("content", "")) for msg in final_trimmed_messages)
-    logger.debug(f"Final token count for {poe_bot_name} after trimming: {final_tokens}")
-    return final_trimmed_messages
-
-async def discover_and_retry_bot_response(
-    original_messages: List[Dict[str, Any]], # These are OpenAI format messages
-    poe_bot_name: str,
-    poe_token: str,
-    openai_model_key: str, # For cost calculation
-    max_retries: int = 3
-) -> AsyncGenerator[Dict[str, Any], None]: # Yields dicts for easier processing
-    """
-    Handles context trimming, calling Poe, and yielding response parts.
-    The footer is now a special dictionary yielded at the end.
-    """
-    initial_limit = MODEL_CONTEXT_LIMITS.get(poe_bot_name, 16000) # Default limit if bot not in map
-    current_limit_override = initial_limit
-    
-    # Calculate original tokens based on the original_messages for the warning message
-    original_total_tokens = sum(count_tokens(str(msg.get("content", "")), poe_bot_name) for msg in original_messages)
-    
-    for attempt in range(max_retries):
-        logger.debug(f"Attempt {attempt + 1}/{max_retries} for {poe_bot_name} with context limit override: {current_limit_override}")
-        
-        # Enforce context limit on the original messages for this attempt
-        messages_for_this_attempt_openai_fmt = enforce_context_limit(original_messages, poe_bot_name, limit_override=current_limit_override)
-        
-        if not messages_for_this_attempt_openai_fmt:
-            logger.warning(f"No messages left after context enforcement for {poe_bot_name} on attempt {attempt + 1}. Skipping Poe call.")
-            # Yield a special message or break, then yield footer
-            yield {"type": "content", "text": "[Error: No content after context trimming]"}
-            break 
-
-        was_trimmed_for_this_attempt = len(messages_for_this_attempt_openai_fmt) < len(original_messages) or \
-                                       sum(count_tokens(str(m.get("content","")), poe_bot_name) for m in messages_for_this_attempt_openai_fmt) < original_total_tokens
-
-
-        # Convert to Poe message format
-        poe_protocol_messages = []
-        for msg in messages_for_this_attempt_openai_fmt:
-            content = msg.get("content", "")
-            if isinstance(content, list): # Your image handling
-                formatted_content_list = []
-                for item in content:
-                    if item.get("type") == "text":
-                        formatted_content_list.append({"type": "text", "text": item.get("text", "")})
-                    elif item.get("type") == "image" and "image_url" in item:
-                        image_url = item["image_url"]
-                        if "base64," in image_url:
-                            base64_data = image_url.split("base64,")[1]
-                            formatted_content_list.append({
-                                "type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64_data}
-                            })
-                current_content = formatted_content_list
-            else:
-                current_content = str(content)
-            poe_protocol_messages.append({
-                "role": "bot" if msg.get("role") == "assistant" else msg.get("role", "user"),
-                "content": current_content
-            })
-
-        full_response_parts = []
-        received_chunks_this_attempt = False
-        api_call_start_time = time.time()
-
-        try:
-            async for partial in fp.get_bot_response(
-                messages=poe_protocol_messages,
-                bot_name=poe_bot_name,
-                api_key=poe_token
-            ):
-                if time.time() - api_call_start_time > 60: # 60s timeout for the call itself
-                    logger.warning(f"Poe API call timeout for {poe_bot_name} during attempt {attempt + 1}")
-                    yield {"type": "error", "text": "[Poe API call timeout]"}
-                    break # Break from inner async for, will go to next retry if any
-
-                if hasattr(partial, 'text') and partial.text:
-                    # Don't yield internal markers like footer markers from Poe itself (if any)
-                    if not any(marker in partial.text for marker in ['📊 Tokens:', '💰 Points:']):
-                        full_response_parts.append(partial.text)
-                        yield {"type": "content", "text": partial.text}
-                        received_chunks_this_attempt = True
-            
-            if received_chunks_this_attempt: # Successful attempt
-                logger.info(f"Successfully received response from {poe_bot_name} on attempt {attempt + 1}")
-                # Prepare and yield footer data
-                complete_response_text = "".join(full_response_parts)
-                input_tokens = sum(count_tokens(str(msg.get("content", "")), poe_bot_name) for msg in messages_for_this_attempt_openai_fmt)
-                output_tokens = count_tokens(complete_response_text, poe_bot_name)
-                total_tokens = input_tokens + output_tokens
-                
-                has_images = any(isinstance(msg.get("content"), list) and any(item.get("type") == "image" for item in msg.get("content",[])) for msg in messages_for_this_attempt_openai_fmt)
-                points_info = calculate_points(openai_model_key, total_tokens, has_images=has_images) # Use openai_model_key for costs
-
-                footer_data_dict = {
-                    "tokens_input": input_tokens,
-                    "tokens_output": output_tokens,
-                    "tokens_total": total_tokens,
-                    "points": points_info['points'],
-                    "points_breakdown": points_info['breakdown'],
-                    "was_trimmed": was_trimmed_for_this_attempt,
-                    "original_total_tokens": original_total_tokens if was_trimmed_for_this_attempt else None
-                }
-                yield {"type": "footer", "data": footer_data_dict}
-                return # Success, exit generator
-
-            # If no chunks received and no exception, it means Poe stream ended cleanly but empty
-            logger.warning(f"No chunks received from {poe_bot_name} on attempt {attempt + 1} with limit {current_limit_override}. Trying smaller context.")
-            current_limit_override //= 2
-            if current_limit_override < 2000: # Arbitrary minimum
-                logger.error(f"Context limit for {poe_bot_name} too small after retries ({current_limit_override}). Giving up.")
-                yield {"type": "error", "text": "[Context limit too small after retries]"}
-                break # Break from outer for loop
-
-        except Exception as e:
-            logger.error(f"Error in bot response from {poe_bot_name} on attempt {attempt + 1}: {str(e)}")
-            traceback.print_exc()
-            if attempt == max_retries - 1:
-                yield {"type": "error", "text": f"[Poe API Error: {str(e)}]"}
-                raise # Re-raise on last attempt
-            current_limit_override //= 2 # Reduce context for next retry
-            if current_limit_override < 2000:
-                logger.error(f"Context limit for {poe_bot_name} too small after error ({current_limit_override}). Giving up.")
-                yield {"type": "error", "text": "[Context limit too small after error]"}
-                break
-            logger.info(f"Retrying for {poe_bot_name} with new context limit override: {current_limit_override}")
-            # Continue to next attempt
-
-    # If all retries failed to get chunks
-    yield {"type": "footer", "data": {"error": "Failed to get response after all retries."}}
-
-
-# Helper function to format SSE data
 def format_sse_chunk(data_dict: Dict, request_id: str, model_name: str, finish_reason: Optional[str] = None) -> str:
     sse_payload = {
         "id": f"chatcmpl-{request_id}",
@@ -384,229 +172,382 @@ def format_sse_chunk(data_dict: Dict, request_id: str, model_name: str, finish_r
         "model": model_name,
         "choices": [{
             "index": 0,
-            "delta": data_dict, # e.g., {"content": "text"} or {} for done
+            "delta": data_dict,
             "finish_reason": finish_reason
         }]
     }
-    json_data = json.dumps(sse_payload)
-    return f"data: {json_data}\n\n"
+    return f"data: {json.dumps(sse_payload)}\n\n"
 
-async def stream_openai_sse_response(
-    original_messages: List[Dict[str, Any]], # OpenAI format
-    poe_bot_name: str,
-    poe_token: str,
-    openai_model_key: str, # For SSE "model" field and cost calculation
+def make_clear_error_message(status_code: int, api_error: Optional[Dict[str, Any]]) -> str:
+    mapped_type, when = ERROR_WHEN_MAP.get(status_code, ("unknown_error", "Unknown error"))
+    e_type = api_error.get("type") if api_error and api_error.get("type") else mapped_type
+    e_code = api_error.get("code") if api_error and api_error.get("code") else status_code
+    e_msg = api_error.get("message") if api_error else "No message"
+    return f"[Poe API Error] code={e_code}, type={e_type}, when='{when}', message='{e_msg}'"
+
+def sanitize_messages(messages: Any) -> List[Dict[str, str]]:
+    if not isinstance(messages, list) or len(messages) == 0:
+        return [{"role": "user", "content": ""}]
+
+    cleaned: List[Dict[str, str]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned.append({"role": "user", "content": str(msg)})
+            continue
+
+        role = str(msg.get("role", "user")).lower()
+        if role not in ALLOWED_ROLES:
+            role = "user"
+
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            text_out = content
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(str(part.get("text", "")))
+            text_out = "".join(parts)
+        else:
+            text_out = str(content)
+
+        cleaned.append({"role": role, "content": text_out})
+
+    if not cleaned:
+        cleaned = [{"role": "user", "content": ""}]
+    return cleaned
+
+def clip_context_by_tokens(messages: List[Dict[str, str]], model_id: str, per_bot_cap: Optional[int], global_cap: int) -> List[Dict[str, str]]:
+    cap = min([c for c in [per_bot_cap, global_cap] if c is not None], default=global_cap)
+    if cap is None:
+        return messages
+
+    def msg_tokens(m: Dict[str, str]) -> int:
+        return count_tokens(m.get("content", "") or "", model_id)
+
+    total = sum(msg_tokens(m) for m in messages)
+    if total <= cap:
+        return messages
+
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    other_msgs = [m for m in messages if m.get("role") != "system"]
+
+    kept: List[Dict[str, str]] = []
+    running = sum(msg_tokens(m) for m in system_msgs)
+    if running > cap:
+        logger.warning(f"System prompt exceeds cap for {model_id}; dropping all non-system context.")
+        return []
+
+    for m in reversed(other_msgs):
+        t = msg_tokens(m)
+        if running + t <= cap:
+            kept.insert(0, m)
+            running += t
+        else:
+            break
+
+    return system_msgs + kept
+
+async def call_poe_openai_compatible(payload: Dict[str, Any], stream: bool) -> Union[AsyncGenerator[Dict[str, Any], None], Dict[str, Any]]:
+    """
+    Returns:
+      - If stream=True: async generator of events
+      - If stream=False: response dict
+
+    Retry ladder on 400:
+      1) as-is
+      2) remove max_tokens/max_completion_tokens
+      3) lowercase model
+      4) lowercase + remove max_tokens
+    """
+    api_key = get_poe_token()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    base_url = os.getenv("POE_BASE_URL", "https://api.poe.com/v1")
+    url = f"{base_url}/chat/completions"
+
+    def redact_payload_for_log(p: Dict[str, Any]) -> str:
+        try:
+            meta = {k: p[k] for k in p if k != "messages"}
+            return json.dumps(meta, ensure_ascii=False)
+        except Exception:
+            return "{}"
+
+    # Build attempt variants
+    attempts: List[Dict[str, Any]] = []
+    base_payload = dict(payload)
+    attempts.append(base_payload)
+
+    p2 = dict(base_payload)
+    p2.pop("max_tokens", None)
+    p2.pop("max_completion_tokens", None)
+    attempts.append(p2)
+
+    p3 = dict(base_payload)
+    if isinstance(p3.get("model"), str):
+        p3["model"] = p3["model"].lower()
+    attempts.append(p3)
+
+    p4 = dict(p3)
+    p4.pop("max_tokens", None)
+    p4.pop("max_completion_tokens", None)
+    attempts.append(p4)
+
+    if stream:
+        async def stream_attempt(ap: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+            # Create a client per attempt and keep it open for the duration of this generator
+            timeout = httpx.Timeout(300.0, connect=30.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream("POST", url, headers=headers, json=ap) as resp:
+                    if resp.status_code >= 400:
+                        if resp.status_code == 400:
+                            try:
+                                logger.error(f"Poe 400 payload debug (model={ap.get('model')}): {redact_payload_for_log(ap)}; messages_count={len(ap.get('messages', []))}")
+                            except Exception:
+                                pass
+                        try:
+                            err = resp.json()
+                        except Exception:
+                            err = None
+                        yield {"type": "error", "text": make_clear_error_message(resp.status_code, err.get("error") if isinstance(err, dict) else None)}
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data_line = line[len("data:"):].strip()
+                        if data_line == "[DONE]":
+                            yield {"type": "done"}
+                            return
+                        try:
+                            evt = json.loads(data_line)
+                            yield {"type": "chunk", "data": evt}
+                        except Exception:
+                            continue
+
+        # Orchestrate attempts sequentially; on first event "error", try next; else forward
+        async def orchestrator():
+            for ap in attempts:
+                first_event: Optional[Dict[str, Any]] = None
+                first_yielded = False
+                async for evt in stream_attempt(ap):
+                    if not first_yielded:
+                        first_event = evt
+                        first_yielded = True
+                        if evt.get("type") == "error":
+                            # Try next attempt
+                            break
+                        else:
+                            yield evt
+                    else:
+                        yield evt
+                # If first_event was error, continue to next attempt
+                if first_event and first_event.get("type") != "error":
+                    # Successful attempt already streaming; we consumed until done
+                    return
+            # All attempts failed; emit last error
+            yield {"type": "error", "text": "[All streaming attempts failed]"}
+
+        return orchestrator()
+
+    else:
+        # Non-streaming attempts
+        timeout = httpx.Timeout(300.0, connect=30.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            last_err = None
+            for ap in attempts:
+                resp = await client.post(url, headers=headers, json=ap)
+                if resp.status_code >= 400:
+                    if resp.status_code == 400:
+                        try:
+                            logger.error(f"Poe 400 payload debug (model={ap.get('model')}): {redact_payload_for_log(ap)}; messages_count={len(ap.get('messages', []))}")
+                        except Exception:
+                            pass
+                    try:
+                        err = resp.json()
+                    except Exception:
+                        err = None
+                    last_err = make_clear_error_message(resp.status_code, err.get("error") if isinstance(err, dict) else None)
+                    continue
+                return resp.json()
+            raise HTTPException(status_code=400, detail=last_err or "Bad Request")
+
+async def stream_openai_sse_response_from_poe(
+    payload: Dict[str, Any],
     request_id: str
 ) -> AsyncGenerator[str, None]:
-    """
-    Streams response from discover_and_retry_bot_response, formats as OpenAI SSE.
-    """
-    async for item in discover_and_retry_bot_response(
-        original_messages=original_messages,
-        poe_bot_name=poe_bot_name,
-        poe_token=poe_token,
-        openai_model_key=openai_model_key # Pass this along
-    ):
-        if item["type"] == "content":
-            yield format_sse_chunk(data_dict={"content": item["text"]}, request_id=request_id, model_name=openai_model_key)
-        elif item["type"] == "footer":
-            footer_text = f"\n\n---\n📊 Tokens: {item['data'].get('tokens_total', 'N/A'):,} (Input: {item['data'].get('tokens_input', 'N/A'):,}, Output: {item['data'].get('tokens_output', 'N/A'):,})\n💰 Points: {item['data'].get('points', 'N/A')} ({item['data'].get('points_breakdown', 'N/A')})"
-            if item["data"].get("was_trimmed"):
-                footer_text += f"\n⚠️ Input was trimmed from {item['data'].get('original_total_tokens', 'N/A'):,} to {item['data'].get('tokens_input', 'N/A'):,} tokens due to model context limitations"
-            elif item["data"].get("error"):
-                 footer_text = f"\n\n---\nPROXY INFO: {item['data']['error']}"
+    model_id = payload.get("model", "unknown")
+    gen = await call_poe_openai_compatible(payload, stream=True)
+    usage_totals: Optional[Dict[str, Any]] = None
 
-            yield format_sse_chunk(data_dict={"content": footer_text}, request_id=request_id, model_name=openai_model_key)
-            # After footer, send the done signal
-            yield format_sse_chunk(data_dict={}, request_id=request_id, model_name=openai_model_key, finish_reason="stop")
+    async for evt in gen:
+        if evt["type"] == "error":
+            yield format_sse_chunk(data_dict={"content": f"\n\n{evt['text']}"}, request_id=request_id, model_name=model_id, finish_reason="error")
+            yield format_sse_chunk(data_dict={}, request_id=request_id, model_name=model_id, finish_reason="error")
             yield "data: [DONE]\n\n"
-            return # End stream after footer
-        elif item["type"] == "error":
-            yield format_sse_chunk(data_dict={"content": f"\n\n[PROXY ERROR: {item['text']}]"}, request_id=request_id, model_name=openai_model_key, finish_reason="error")
-            # After error, send the done signal
-            yield format_sse_chunk(data_dict={}, request_id=request_id, model_name=openai_model_key, finish_reason="error")
-            yield "data: [DONE]\n\n"
-            return # End stream after error
-    
-    # Fallback DONE signal if the loop completes without footer/error (shouldn't happen with current logic)
-    logger.debug("Stream ended without explicit footer or error yield, sending DONE.")
-    yield format_sse_chunk(data_dict={}, request_id=request_id, model_name=openai_model_key, finish_reason="stop")
-    yield "data: [DONE]\n\n"
+            return
 
+        if evt["type"] == "chunk":
+            data = evt["data"]
+            choices = data.get("choices", [{}])
+            delta = choices[0].get("delta", {}) if choices else {}
+            finish_reason = choices[0].get("finish_reason") if choices else None
+
+            if "usage" in data and isinstance(data["usage"], dict):
+                usage_totals = data["usage"]
+
+            if delta.get("content"):
+                yield format_sse_chunk(data_dict={"content": delta["content"]}, request_id=request_id, model_name=model_id)
+
+            if finish_reason:
+                footer = ""
+                if usage_totals:
+                    total = usage_totals.get('total_tokens')
+                    prompt = usage_totals.get('prompt_tokens')
+                    completion = usage_totals.get('completion_tokens')
+                    footer = f"\n\n---\n📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})"
+                    pts = calculate_points_from_registry(model_id, (total or 0))
+                    if pts:
+                        footer += f"\n💰 Points: {pts['points']} ({pts['breakdown']})"
+                yield format_sse_chunk(data_dict={"content": footer}, request_id=request_id, model_name=model_id, finish_reason="stop")
+                yield "data: [DONE]\n\n"
+                return
+
+        if evt["type"] == "done":
+            footer = ""
+            if usage_totals:
+                total = usage_totals.get('total_tokens')
+                prompt = usage_totals.get('prompt_tokens')
+                completion = usage_totals.get('completion_tokens')
+                footer = f"\n\n---\n📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})"
+                pts = calculate_points_from_registry(model_id, (total or 0))
+                if pts:
+                    footer += f"\n💰 Points: {pts['points']} ({pts['breakdown']})"
+            yield format_sse_chunk(data_dict={"content": footer}, request_id=request_id, model_name=model_id, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+            return
+
+async def nonstream_openai_response_from_poe(payload: Dict[str, Any]) -> Dict[str, Any]:
+    model_id = payload.get("model", "unknown")
+    try:
+        data = await call_poe_openai_compatible(payload, stream=False)
+        if "choices" not in data or not data["choices"]:
+            data["choices"] = [{"message": {"role": "assistant", "content": ""}}]
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            total = usage.get('total_tokens')
+            prompt = usage.get('prompt_tokens')
+            completion = usage.get('completion_tokens')
+            footer = f"\n\n---\n📊 Tokens: {total if total is not None else 'N/A'} (Input: {prompt if prompt is not None else 'N/A'}, Output: {completion if completion is not None else 'N/A'})"
+            pts = calculate_points_from_registry(model_id, (total or 0))
+            if pts:
+                footer += f"\n💰 Points: {pts['points']} ({pts['breakdown']})"
+            content = data["choices"][0]["message"].get("content") or ""
+            data["choices"][0]["message"]["content"] = f"{content}{footer}"
+        return data
+    except HTTPException as e:
+        status = e.status_code
+        msg = str(e.detail)
+        raise HTTPException(status_code=status, detail={"error": {"code": status, "type": ERROR_WHEN_MAP.get(status, ('unknown_error',''))[0], "message": msg, "metadata": {}}})
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, poe_token: str = Depends(get_poe_token)):
-    DEBUG_TAGS = {
-        "request_start": "🌍🗳️", "request_end": "🔚", "api_call": "📡",
-        "chunk_receive": "📦", "error": "🔴", "warning": "⚠️",
-        "cache": "💾", "rate_limit": "⏳"
-    }
-    request.state.api_calls = 0
-    request.state.chunks_received = 0 # For non-streaming chunk count
+    DEBUG_TAGS = {"request_start": "🌍🗳️", "request_end": "🔚", "api_call": "📡", "error": "🔴", "cache": "💾", "rate_limit": "⏳"}
     request.state.start_time = time.time()
-    
+
     try:
         logger.debug(f"{DEBUG_TAGS['request_start']} New Request | Client: {request.client.host}")
-        # ... (Rate Limiting logic - unchanged) ...
-        RATE_LIMIT = 10; WINDOW_MINUTES = 1; client_ip = request.client.host; current_minute = int(time.time() // 60)
-        if not hasattr(request.app.state, "rate_limits"): request.app.state.rate_limits = {}
-        client_bucket = request.app.state.rate_limits.get(client_ip, {"count": 0, "minute": current_minute})
-        if client_bucket["minute"] != current_minute: client_bucket = {"count": 0, "minute": current_minute}
-        if client_bucket["count"] >= RATE_LIMIT:
-            logger.warning(f"{DEBUG_TAGS['rate_limit']} Rate limited: {client_ip}")
+
+        # Simple per-IP rate limit
+        RATE_LIMIT = 10
+        client_ip = request.client.host
+        current_minute = int(time.time() // 60)
+        if not hasattr(request.app.state, "rate_limits"):
+            request.app.state.rate_limits = {}
+        bucket = request.app.state.rate_limits.get(client_ip, {"count": 0, "minute": current_minute})
+        if bucket["minute"] != current_minute:
+            bucket = {"count": 0, "minute": current_minute}
+        if bucket["count"] >= RATE_LIMIT:
             raise HTTPException(status_code=429, detail="Too many requests")
-        client_bucket["count"] += 1; request.app.state.rate_limits[client_ip] = client_bucket
-        logger.debug(f"{DEBUG_TAGS['rate_limit']} Requests: {client_bucket['count']}/{RATE_LIMIT}")
+        bucket["count"] += 1
+        request.app.state.rate_limits[client_ip] = bucket
 
-        request_body = await request.body()
-        data = json.loads(request_body.decode())
-        
-        is_streaming_request = data.get("stream", False)
-        openai_model_key = data.get("model", "claude-3.5-sonnet") # Original key from request
-        
-        request_hash_content = (
-            f"{openai_model_key}_"
-            f"{str(data.get('messages', []))}_" # Ensure messages are part of hash
-            f"{data.get('temperature', 1.0)}_"
-            f"{data.get('max_tokens', 0)}" # Or other relevant params
-        )
-        request_hash = hash(request_hash_content)
+        body = await request.body()
+        data = json.loads(body.decode())
 
-        if not is_streaming_request: # Only use cache for non-streaming
-            if not hasattr(request.app.state, "request_cache"): request.app.state.request_cache = {}
-            if cached := request.app.state.request_cache.get(request_hash):
-                logger.debug(f"{DEBUG_TAGS['cache']} Serving cached non-streaming response")
-                return cached
+        model_id = data.get("model")
+        if not model_id:
+            raise HTTPException(status_code=400, detail="Missing 'model'")
+        try:
+            model_cfg = REGISTRY.get(model_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
-        original_openai_messages = data.get("messages", [])
-        
-        poe_bot_name = MODEL_MAP.get(openai_model_key)
-        if not poe_bot_name:
-            raise HTTPException(status_code=400, detail=f"Unsupported model: {openai_model_key}")
+        modality = model_cfg.get("modality", "text")
+        is_stream = bool(data.get("stream", modality == "text"))  # stream all text bots by default
 
-        # Initial context enforcement is now inside discover_and_retry_bot_response
-        # and stream_openai_sse_response will call it.
-        # No, enforce_context_limit should be called before passing to these generators
-        # as they expect OpenAI format messages.
-        # However, discover_and_retry_bot_response now handles its own enforcement internally.
+        # Sanitize messages
+        sanitized_messages = sanitize_messages(data.get("messages", []))
 
-        request_id = str(uuid4())
+        # Enforce n==1 if present
+        if "n" in data and data["n"] != 1:
+            logger.debug("Overriding n to 1 for Poe compatibility")
+            data["n"] = 1
 
-        if is_streaming_request:
-            logger.debug(f"{DEBUG_TAGS['api_call']} Starting STREAMING API call to Poe bot: {poe_bot_name} (for OpenAI model: {openai_model_key})")
+        # Clip context by tokens for text bots using per-bot cap and global cap
+        per_bot_cap = model_cfg.get("max_tokens") if modality == "text" else None
+        global_cap = REGISTRY.get_default_text_max_tokens() if modality == "text" else None
+        clipped_messages = clip_context_by_tokens(sanitized_messages, model_id, per_bot_cap, global_cap) if modality == "text" else sanitized_messages
+
+        # Build payload
+        payload = {
+            "model": model_id,
+            "messages": clipped_messages,
+            "stream": is_stream,
+        }
+        passthrough_fields = [
+            "max_tokens", "max_completion_tokens",
+            "top_p", "tools", "tool_choice", "parallel_tool_calls",
+            "stop", "temperature", "n", "stream_options"
+        ]
+        for f in passthrough_fields:
+            if f in data:
+                payload[f] = data[f]
+
+        if is_stream:
             return StreamingResponse(
-                stream_openai_sse_response(
-                    original_messages=original_openai_messages, # Pass original OpenAI messages
-                    poe_bot_name=poe_bot_name,
-                    poe_token=poe_token,
-                    openai_model_key=openai_model_key,
-                    request_id=request_id
-                ),
+                stream_openai_sse_response_from_poe(payload, request_id=str(uuid4())),
                 media_type="text/event-stream"
             )
-        else: # Non-streaming request
-            logger.debug(f"{DEBUG_TAGS['api_call']} Starting NON-STREAMING API call to Poe bot: {poe_bot_name} (for OpenAI model: {openai_model_key})")
-            request.state.api_calls = 1
-            api_start_non_stream = time.time()
-            
-            collected_content_parts = []
-            final_footer_data = None
+        else:
+            resp = await nonstream_openai_response_from_poe(payload)
+            return resp
 
-            try:
-                async for item in discover_and_retry_bot_response(
-                    original_messages=original_openai_messages, # Pass original OpenAI messages
-                    poe_bot_name=poe_bot_name,
-                    poe_token=poe_token,
-                    openai_model_key=openai_model_key
-                ):
-                    request.state.chunks_received +=1 # Count all items yielded by discover_and_retry
-                    if item["type"] == "content":
-                        collected_content_parts.append(item["text"])
-                    elif item["type"] == "footer":
-                        final_footer_data = item["data"]
-                        break # Footer is the last thing for non-streaming
-                    elif item["type"] == "error":
-                        # For non-streaming, we might want to include this error in the response
-                        # or raise an HTTPException. Let's include it in content.
-                        collected_content_parts.append(f"\n\n[PROXY ERROR: {item['text']}]")
-                        # final_footer_data might still be None or from a previous attempt if error on retry
-                        if final_footer_data is None: # Ensure footer data exists
-                             final_footer_data = {"error_message": item['text']}
-                        break
-                
-                api_duration_non_stream = time.time() - api_start_non_stream
-                logger.debug(f"{DEBUG_TAGS['api_call']} Non-streaming call processing completed in {api_duration_non_stream:.2f}s")
-
-            except Exception as e:
-                logger.error(f"{DEBUG_TAGS['error']} API failure (non-streaming): {str(e)}")
-                raise HTTPException(status_code=502, detail=f"Model service unavailable: {str(e)}")
-
-            if not collected_content_parts and not final_footer_data: # Should not happen if discover_and_retry yields error/footer
-                logger.error(f"{DEBUG_TAGS['error']} Empty response (non-streaming) from discover_and_retry")
-                raise HTTPException(status_code=504, detail="Model timeout or empty response from internal processing")
-
-            final_response_text = "".join(collected_content_parts)
-            
-            # Append footer to text for non-streaming
-            if final_footer_data:
-                if final_footer_data.get("error"): # Error from discover_and_retry_bot_response itself
-                     final_response_text += f"\n\n---\nPROXY INFO: {final_footer_data['error']}"
-                elif "tokens_total" in final_footer_data: # Normal footer
-                    footer_text = f"\n\n---\n📊 Tokens: {final_footer_data.get('tokens_total', 'N/A'):,} (Input: {final_footer_data.get('tokens_input', 'N/A'):,}, Output: {final_footer_data.get('tokens_output', 'N/A'):,})\n💰 Points: {final_footer_data.get('points', 'N/A')} ({final_footer_data.get('points_breakdown', 'N/A')})"
-                    if final_footer_data.get("was_trimmed"):
-                        footer_text += f"\n⚠️ Input was trimmed from {final_footer_data.get('original_total_tokens', 'N/A'):,} to {final_footer_data.get('tokens_input', 'N/A'):,} tokens due to model context limitations"
-                    final_response_text += footer_text
-                elif final_footer_data.get("error_message"): # Error from Poe API call
-                    # Already appended to collected_content_parts
-                    pass
-
-
-            response_data = {
-                "id": f"chatcmpl-{request_id}", "object": "chat.completion", "created": int(time.time()),
-                "model": openai_model_key,
-                "choices": [{"message": {"role": "bot", "content": final_response_text}}]
-            }
-            
-            if len(final_response_text) > 10: # Only cache substantial responses
-                if not hasattr(request.app.state, "request_cache"): request.app.state.request_cache = {} # Ensure init
-                request.app.state.request_cache[request_hash] = response_data
-                logger.debug(f"{DEBUG_TAGS['cache']} Cached non-streaming response")
-            
-            duration = time.time() - request.state.start_time
-            logger.debug(f"{DEBUG_TAGS['request_end']} Non-streaming completed in {duration:.2f}s | Items from discover: {request.state.chunks_received} | API Calls: {request.state.api_calls}")
-            return response_data
-
-    except HTTPException: # Re-raise HTTPExceptions
+    except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"{DEBUG_TAGS['error']} Unhandled error in chat_completions: {str(e)}")
+        logger.error(f"{DEBUG_TAGS['error']} Unhandled error: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=502, detail={"error": {"code": 502, "type": "upstream_error", "message": str(e), "metadata": {}}})
 
 @app.get("/v1/models")
-async def list_models_endpoint(): # Renamed to avoid conflict if you import list_models from elsewhere
+async def list_models_endpoint():
     return {
         "object": "list",
         "data": [
-            {
-                "id": model_id, # This is the OpenAI model key
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "poe"
-            }
-            for model_id in MODEL_MAP.keys() # Iterate over OpenAI model keys
+            {"id": mid, "object": "model", "created": int(time.time()), "owned_by": "poe"}
+            for mid in REGISTRY.list_ids()
         ]
     }
 
 if __name__ == "__main__":
     logger.info("Starting Poe Proxy Server")
-    # Ensure POE_TOKEN is set before starting
-    if not os.getenv("POE_TOKEN"):
-        logger.error("FATAL: POE_TOKEN environment variable not set. Exiting.")
+    if not os.getenv("POE_TOKEN") and not os.getenv("POE_API_KEY"):
+        logger.error("FATAL: POE_TOKEN or POE_API_KEY environment variable not set. Exiting.")
         exit(1)
     else:
-        logger.info(f"POE_TOKEN is set. Available OpenAI model keys: {list(MODEL_MAP.keys())}")
-    
-    # For Uvicorn, set log_config=None to use the logging configured by logging.basicConfig
-    # Or pass a Uvicorn log config dict. Default Uvicorn logging can be quite different.
+        logger.info(f"Available model ids: {REGISTRY.list_ids()}")
     uvicorn.run(app, host="0.0.0.0", port=8080, log_config=None)

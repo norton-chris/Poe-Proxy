@@ -4,6 +4,7 @@ services:
     container_name: poe-proxy
     environment:
       - POE_TOKEN=jru7WgP-PnYAaWKgiKlM24Y2MJqIrkl3A0zO-daH7bk #0n_4lHAaJynbryLZaSKSRmQZOE65dzTNubh-XwqbfRA  jru7WgP-PnYAaWKgiKlM24Y2MJqIrkl3A0zO-daH7bk
+      - MODELS_FILE=/app/models.yaml
     ports:
       - "0.0.0.0:9876:8080"
     restart: unless-stopped

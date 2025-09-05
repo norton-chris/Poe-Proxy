@@ -9,6 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY proxy.py .
+COPY models.yaml .
 COPY tests /app/tests/
 
 CMD ["python", "proxy.py"]
