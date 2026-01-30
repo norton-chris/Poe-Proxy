@@ -13,8 +13,8 @@ services:
   poe-proxy-tests: # New service for running tests
     build: . # Uses the same Dockerfile
     container_name: poe-proxy-test-runner
-    environment:
-      - POE_TOKEN=jru7WgP-PnYAaWKgiKlM24Y2MJqIrkl3A0zO-daH7bk
+    env_file:
+      - ./.env
     volumes:
       - ./:/app # Mount current directory to /app so code changes are reflected
     command: ["pytest", "-v", "tests/"]

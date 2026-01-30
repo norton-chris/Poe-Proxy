@@ -2,9 +2,9 @@ import asyncio
 import fastapi_poe as fp
 import os
 async def list_available_bots():
-    token = "jru7WgP-PnYAaWKgiKlM24Y2MJqIrkl3A0zO-daH7bk"
+    token = os.getenv("POE_API_KEY") or os.getenv("POE_TOKEN")
     if not token:
-        print("Error: POE_TOKEN environment variable not set")
+        print("Error: POE_API_KEY or POE_TOKEN environment variable not set")
         return
         
     try:

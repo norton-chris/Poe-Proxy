@@ -1,77 +1,57 @@
 defaults:
   text_max_tokens: 200000
+  context_limit: 200000  # Default is no limit; set per-model to enable auto-trimming
 
 models:
   text:
     - poe_name: Gemini-2.5-Flash
-      base: 6
-      per_1k_tokens: 32
+      context_limit: 500000
     - poe_name: Gemini-2.5-Pro
-      base: 716
-      per_1k_tokens: 25
+      context_limit: 200000
     - poe_name: Claude-3.5-Sonnet
-      base: 276
-      per_1k_tokens: 92
+      context_limit: 200000
+    - poe_name: Claude-Haiku-4.5
+      context_limit: 150000
+    - poe_name: Claude-Sonnet-4.5
+      context_limit: 50000
     - poe_name: GPT-4.1
-      base: 226
-      per_1k_tokens: 60
-    - poe_name: GPT-5
-      base: 251
-      per_1k_tokens: 38
+      context_limit: 200000
+    - poe_name: gpt-5.2-instant
+      context_limit: 100000
     - poe_name: GPT-4.1-mini
-      base: 25
-      per_1k_tokens: 12
+      context_limit: 100000
     - poe_name: o4-mini
-      base: 248
-      per_1k_tokens: 33
+      context_limit: 100000
     - poe_name: o3-mini-high
-      base: 422
-      per_1k_tokens: 33
+      context_limit: 100000
     - poe_name: DeepSeek-R1
-      base: 600
-      per_1k_tokens: 0
-    - poe_name: DeepSeek-V3.1
-      base: 260
-      per_1k_tokens: 0
-    - poe_name: llama-4-maverick
-      base: 50
-      per_1k_tokens: 0
-    - poe_name: llama-4-scout
-      base: 30
-      per_1k_tokens: 0
+      context_limit: 168000
+    - poe_name: deepseek-v3
+      context_limit: 168000
     - poe_name: Mistral-Small-3.1
-      base: 64
-      per_1k_tokens: 0
+      context_limit: 100000
     - poe_name: Mistral-Large-2
-      base: 210
-      per_1k_tokens: 100
+      context_limit: 100000
     - poe_name: Perplexity-Sonar
-      base: 400
-      per_1k_tokens: 80
-    - poe_name: QwQ-32B-T
-      base: 250
-      per_1k_tokens: 0
-    - poe_name: GLM-4.5-FW
-      base: 180
-      per_1k_tokens: 0
+      context_limit: 100000
+    - poe_name: GLM-4.7
+      context_limit: 100000
     - poe_name: Kimi-K2-Instruct
-      base: 200
-      per_1k_tokens: 0
+      context_limit: 100000
     - poe_name: GPT-OSS-120B-T
-      base: 50
-      per_1k_tokens: 0
-
+      context_limit: 200000
+    - poe_name: Qwen3-Coder
+      context_limit: 200000
+    - poe_name: minimax-m2.1
+      context_limit: 205000
   image:
-    - poe_name: GPT-Image-1
-      base: 301
-      per_1k_tokens: 151
-
+    - poe_name: Imagen-4-Ultra
+    - poe_name: nano-banana
+    - poe_name: qwen-edit
   video:
     - poe_name: Wan-2.2
-      base: 10000
-      per_1k_tokens: 0
+    - poe_name: Wan-2.5
+    - poe_name: veo-v3.1-fast
 
   audio:
     - poe_name: ElevenLabs-v3
-      base: 0
-      per_1k_tokens: 1000
